@@ -691,6 +691,127 @@ pub async fn query_directory_tree_v2(
     ))
 }
 
+/// 增量加载指定目录下的直接子节点（文件和子目录）
+#[tauri::command]
+pub async fn load_directory_children(
+    dir_path: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<FileTreeNode>, String> {
+    let report = {
+        let report_guard = state.last_report.lock().await;
+        report_guard
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "当前没有扫描报告，请先执行扫描。".to_string())?
+    };
+    
+    Ok(build_directory_children(&report, &dir_path))
+}
+
+fn build_directory_children(report: &ScanReport, dir_path: &str) -> Vec<FileTreeNode> {
+    // 分隔路径
+    let target_parts: Vec<&str> = if dir_path.is_empty() {
+        vec![]
+    } else {
+        dir_path.split('/').collect()
+    };
+    
+    // 记录当前目录下的直接子项{文件名:(是否是目录，大小，扩展名，完整路径)}
+    let mut children_map: HashMap<String, (bool, u64, String, String)> = HashMap::new();
+    
+    for file in &report.scanned_files {
+        //空文件不显示，无意义
+        if file.size == 0 {
+            continue;
+        }
+        
+        let parts = relative_parts(&file.path, &report.root);
+        if parts.is_empty() {
+            continue;
+        }
+        
+        if parts.len() <= target_parts.len() {
+            continue;
+        }
+        
+        // 匹配前缀
+        let prefix_matches = target_parts.iter().enumerate().all(|(i, target)| {
+            parts.get(i).map_or(false, |part| part == *target)
+        });
+        
+        if !prefix_matches {
+            continue;
+        }
+        
+        let child_name = &parts[target_parts.len()];
+        let is_direct_child = parts.len() == target_parts.len() + 1;
+        
+        if is_direct_child {
+            // 直接子文件，直接添加
+            let entry = children_map.entry(child_name.to_string()).or_insert_with(|| {
+                (
+                    false,
+                    0,
+                    file.extension.clone().unwrap_or_default(),
+                    file.path.to_string_lossy().to_string(),
+                )
+            });
+            entry.1 += file.size;
+        } else {
+            // 直接子文件，累加文件大小
+            let entry = children_map.entry(child_name.to_string()).or_insert_with(|| {
+                (
+                    true,
+                    0,
+                    String::new(),
+                    report.root.join(parts[..=target_parts.len()].join("/")).to_string_lossy().to_string(),
+                )
+            });
+            entry.1 += file.size;
+        }
+    }
+    
+    // 转换为 FileTreeNode 列表
+    let mut nodes: Vec<FileTreeNode> = children_map
+        .into_iter()
+        .map(|(name, (is_dir, size, ext, path))| {
+            let key = if is_dir {
+                format!("dir:{}{}{}", dir_path, if dir_path.is_empty() { "" } else { "/" }, name)
+            } else {
+                format!("file:{}{}{}", dir_path, if dir_path.is_empty() { "" } else { "/" }, name)
+            };
+            
+            FileTreeNode {
+                key,
+                name,
+                path,
+                kind: if is_dir { "directory".to_string() } else { "file".to_string() },
+                size,
+                extension: ext,
+                file_count: if is_dir { 0 } else { 1 },
+                children: None,
+            }
+        })
+        .collect();
+    
+    // 排序：目录在前，然后按大小降序，最后按名称升序
+    nodes.sort_by(|left, right| {
+        if left.kind != right.kind {
+            return if left.kind == "directory" {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+        }
+        if left.size != right.size {
+            return right.size.cmp(&left.size);
+        }
+        left.name.cmp(&right.name)
+    });
+    
+    nodes
+}
+
 fn summarize_report_for_frontend(
     report: &ScanReport,
     async_status: Option<&ScanAsyncStatus>,

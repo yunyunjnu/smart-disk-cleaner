@@ -414,6 +414,10 @@ export interface FileTreeQueryResult {
   rows: FileTreeRow[];
 }
 
+export interface LoadChildrenRequest {
+  dirPath: string;
+}
+
 export type ExecutionMode = "recycle" | "move";
 export type OperationRecordKind = "file_cleanup" | "migration" | "registry_change" | "registry_rollback";
 
@@ -561,3 +565,21 @@ export type ProgressEvent =
   | ScanProgressEvent
   | DedupProgressEvent
   | AnalyzeProgressEvent;
+
+
+export interface RawNode {
+  name: string;
+  value: number;
+  path: string[];
+  kind: "dir"|"file";
+  load?: "undo"|"wait"|"done";
+  hidden: boolean;
+  chioced?: boolean;
+  itemStyle?: any;
+  upperLable?:any;
+  children?: RawNode[];
+  aiStatu?: "undo"|"wait"|"done",
+  aiBrief?: string,
+  aiRank?: "low" | "medium" | "high",
+  aiReson?:string,
+}

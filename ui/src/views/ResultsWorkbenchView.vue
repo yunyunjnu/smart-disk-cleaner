@@ -1,11 +1,13 @@
 ﻿<script setup lang="ts">
 import { invoke } from "@tauri-apps/api/core";
-import { computed, h, onBeforeUnmount, ref, watch } from "vue";
+import { computed, h, onBeforeUnmount, ref, watch, nextTick } from "vue";
 import { useRouter } from "vue-router";
 import {
   NAlert,
   NButton,
   NCard,
+  NRadioGroup,
+  NRadioButton,
   NDataTable,
   NEmpty,
   NGi,
@@ -22,7 +24,7 @@ import {
 } from "naive-ui";
 import VChart from "vue-echarts";
 import { use } from "echarts/core";
-import { PieChart } from "echarts/charts";
+import { PieChart, TreemapChart } from "echarts/charts";
 import {
   LegendComponent,
   TitleComponent,
@@ -46,6 +48,9 @@ import type {
   ScanModuleSummary,
   SuggestedAction,
 } from "@/types";
+import candlestickLayout from "echarts/types/src/chart/candlestick/candlestickLayout.js";
+import { convertCompilerOptionsFromJson } from "typescript";
+import { onMounted } from "vue";
 
 type FileCategory =
   | "all"
@@ -151,6 +156,17 @@ const TEXT = {
   fileTreeDefaultMode: "当前默认先展示顶层目录/文件概览。输入关键词、选择类型或点击应用卡片后，会切换到更细的详细树。",
   explorerTitle: "资源浏览器",
   explorerHint: "在同一张卡片里查看目录、子目录和子文件。默认目录全部收起，展开后按空间占用大小排序。",
+  visialeExplorerTitle: "可视化资源浏览器",
+  multiChoice:"多项选择",
+  multiDarg:"拖动",
+  clickToExpand: "展开/收起文件夹",
+  clickToDig:"进入文件夹",
+  toParentPath: "返回上级目录",
+  toChoiceAll: "全选",
+  toChoiceInvert:"反选",
+  toChoiceNull:"空选",
+  toPackAll:"收起全部",
+  toAiAdvise:"所选项ai分析",
   suggestionsLimited: "建议列表已做截断，仅展示前 1000 条建议。",
   duplicateGroupsLimited: "重复文件组已做截断，仅展示前 10 组。",
   sectionLimited: "当前结果页仅展示前 50 项，避免大盘扫描导致页面占用过高。",
@@ -159,7 +175,7 @@ const TEXT = {
   dedupFailedTitle: "重复文件后台识别失败",
 };
 
-use([PieChart, TitleComponent, TooltipComponent, LegendComponent, CanvasRenderer]);
+use([PieChart, TreemapChart, TitleComponent, TooltipComponent, LegendComponent, CanvasRenderer]);
 
 const router = useRouter();
 const store = useAppStore();
@@ -282,6 +298,550 @@ const explorerMatchedCount = computed(() =>
 const explorerNodeCount = computed(() =>
   isDefaultFileTreeMode.value ? directoryTreeResult.value.nodeCount : fileTreeResult.value.nodeCount
 );
+
+const isChartFullscreen = ref(false);
+const chartRef = ref<any>(null);
+
+function toggleFullscreen() {
+  isChartFullscreen.value = !isChartFullscreen.value;
+  
+  nextTick(() => {
+    if (chartRef.value) {
+      chartRef.value.resize();
+    }
+  });
+}
+
+interface RawNode {
+  name: string;
+  value: number;
+  path: string[];
+  kind: "dir"|"file";
+  load?: "undo"|"wait"|"done";
+  hidden: boolean;
+  chioced?: boolean;
+  itemStyle?: any;
+  upperLable?:any;
+  children?: RawNode[];
+  aiStatu?: "undo"|"wait"|"done",
+  aiBrief?: string,
+  aiRank?: "low" | "medium" | "high",
+  aiReson?:string,
+}
+
+// const viewRawData = ref<RawNode[]>([
+//   {
+//     name:'.',
+//     value: 1500,
+//     path:[],
+//     hidden:false,
+//     chioced:false,
+//     children:[
+//       {
+//         name: 'Folder A',
+//         value: 1000,
+//         path: ['.'],
+//         hidden: false,
+//         chioced:false,
+//         children: [
+//           {
+//             name: 'File A1',
+//             value: 400,
+//             path: ['.','Folder A'],
+//             hidden: false,
+//             chioced:false,
+//           },
+//           { 
+//             name: 'File A2',
+//             value: 600, 
+//             path: ['.','Folder A'],
+//             hidden: false,
+//             chioced:false,
+//           }
+//         ]
+//       },
+//       {
+//         name: 'Folder B',
+//         value: 500,
+//         path: ['.'],
+//         hidden: false,
+//         chioced:false,
+//         children: [
+//           {
+//             name: 'File B1', 
+//             value: 200, 
+//             path: ['.','Folder B'], 
+//             hidden: false,
+//             chioced:false,
+//           },
+//           { 
+//             name: 'File B2', 
+//             value: 300, 
+//             path: ['.','Folder B'],
+//             hidden: false,
+//             chioced:false,
+//           }
+//         ]
+//       }
+//     ]
+//   }
+// ]);
+
+
+const viewRawData = ref<RawNode[]>([
+  {
+    name:'.',
+    value: 0,
+    path:[],
+    hidden:false,
+    chioced:false,
+    kind:"dir",
+  }]
+)
+const viewRootPath = ref(['.']);
+const chartClickMode = ref('expand');
+const choicedFilePath = ref(new Set<string>());
+
+async function loadChildrenForNode(node: RawNode) {
+  if (!report.value) {
+    message.error('没有扫描报告');
+    return;
+  }
+  
+  try {
+    const relativePath = [...node.path,node.name].join('/').slice(2);
+    const children = await invoke<FileTreeRow[]>('load_directory_children', {
+      dirPath: relativePath
+    });
+    
+    function convertToRawNode(row: FileTreeRow): RawNode {
+      const newPath = [...node.path,node.name];
+      
+      return {
+        name: row.name,
+        value: Math.round(row.size / 1024),
+        path: newPath,
+        kind: row.kind === 'directory' ? 'dir' : 'file',
+        load: row.kind === 'directory' ? 'undo' : 'done',
+        hidden: true,
+        chioced: false,
+        children: undefined,
+      };
+    }
+    
+    node.children = children.map(convertToRawNode);
+    message.success(`已加载 ${children.length} 个子项`);
+    node.load = 'done';
+  } catch (error) {
+    message.error(`加载子节点失败：${error}`);
+    node.load = 'undo';
+  }
+}
+
+async function loadChildrenInit() {
+  if (!report.value) {
+    message.error('没有扫描报告');
+    return;
+  }
+  
+  try {
+    const children = await invoke<FileTreeRow[]>('load_directory_children', {
+      dirPath: ''
+    });
+    
+    function convertToRawNode(row: FileTreeRow): RawNode {
+      const newPath = ['.'];
+      
+      return {
+        name: row.name,
+        value: Math.round(row.size / (1024)),
+        path: newPath,
+        kind: row.kind === 'directory' ? 'dir' : 'file',
+        load: row.kind === 'directory' ? 'undo' : 'done',
+        hidden: true,
+        chioced: false,
+        children: undefined,
+      };
+    }
+    
+    viewRawData.value[0].children = children.map(convertToRawNode);
+  } catch (error) {
+    message.error(`加载子节点失败：${error}`);
+  }
+}
+
+onMounted(()=>{
+  void loadChildrenInit();
+});
+
+
+function getNodeByPath(path:string[]){ 
+  if(!path||path.length<1)
+  {
+    console.log('path is null');
+    return null;
+  }
+  let node:RawNode[]=viewRawData.value;
+  for(let i=0;i<path.length;i++)
+  {
+    let find=node.find(n=>n.name==path[i]);
+    if(find==null)
+    {
+      console.log(`not find node ${path[i]}`);
+      return null;
+    }
+    if(i<path.length-1)
+    {
+      if(find.children){
+        node=find.children;
+      }        
+    }
+    else{return find;}
+  }
+  return null;
+}
+
+function handleChartClick(params: any) {
+  if(chartClickMode.value=='expand')
+  {
+    const path=[...params.data.path, params.data.name];
+    let node=getNodeByPath(path);
+    
+    if(node==null)
+    {
+      console.log('node is null');
+      return;
+    }
+    
+    node.hidden=!(node.hidden ?? false);
+    
+    if(!node.hidden && node.kind === 'dir' && (node?.load??"undo")==="undo" && !node.children)
+    {
+      node.load="wait";
+      void loadChildrenForNode(node);
+    }
+  }
+  else if(chartClickMode.value=='dig')
+  {
+    if(params.data.children && params.data.children.length > 0)
+    {
+      viewRootPath.value = [...params.data.path, params.data.name]; 
+    }
+  }
+  else if(chartClickMode.value=='multi')
+  {
+    const path = [...params.data.path, params.data.name];
+    const pathKey = path.join('/');
+    let node = getNodeByPath(path);
+    
+    if(node == null) {
+      console.log('node is null');
+      return;
+    }
+    
+    if(choicedFilePath.value.has(pathKey)) {
+      choicedFilePath.value.delete(pathKey);
+      node.chioced = false;
+    } else {
+      choicedFilePath.value.add(pathKey);
+      node.chioced = true;
+    }
+  }
+}
+
+function handleToParentPath() {
+  if (viewRootPath.value.length>1)
+  {
+    viewRootPath.value=viewRootPath.value.slice(0, -1);
+  }
+}
+
+function choiceAllSub(path:string[],mode:"choice"|"invert"|"unchoice"){
+  let node=getNodeByPath(path);
+  if(node==null) return;
+  if(node?.children==null) return;
+  if(node.children.length==0) return;
+  for(let i=0;i<node.children.length;i++)
+  {
+    if(mode=="choice")
+    {
+      node.children[i].chioced=true;
+      choicedFilePath.value.add([...node.children[i].path,node.children[i].name].join('/'))      
+    }
+    else if(mode=="invert")
+    {
+      if(node.children[i]?.chioced??false)
+      {
+        node.children[i].chioced=false;
+        choicedFilePath.value.delete([...node.children[i].path,node.children[i].name].join('/'));
+      }
+      else
+      {
+        node.children[i].chioced=true;
+        choicedFilePath.value.add([...node.children[i].path,node.children[i].name].join('/'));
+      }
+    }
+    else if(mode=="unchoice")
+    {
+      node.children[i].chioced=false;
+      choicedFilePath.value.delete([...node.children[i].path,node.children[i].name].join('/'))   
+    }
+    if(node.children[i].hidden==false)
+    {
+      let path=[...node.children[i].path,node.children[i].name].join('/');
+      choiceAllSub([...node.children[i].path,node.children[i].name],mode);
+    }
+  }
+}
+
+function handleToChoiceAll(){
+  choiceAllSub(viewRootPath.value,"choice");
+}
+
+function handleToChoiceInvert()
+{
+  choiceAllSub(viewRootPath.value,"invert");
+}
+
+function handleToChoiceNull()
+{
+  choiceAllSub(viewRootPath.value,"unchoice")
+}
+
+function packAllSub(path:string[])
+{
+  let node=getNodeByPath(path);
+  if(node==null) return;
+  if(node?.children==null) return;
+  if(node.children.length==0) return;
+  for(let i=0;i<node.children.length;i++)
+  {
+    node.children[i].hidden=true;   
+    packAllSub([...node.children[i].path,node.children[i].name]);
+  }
+}
+function handleToPackAll() {
+  packAllSub(viewRootPath.value);
+}
+
+function buildViewData(node:RawNode[])
+{
+  const isDark = store.theme === 'dark';
+  const backgroundColor = isDark ? '#0f172a' : '#f4f7fb';
+  const anotherBackgroundColor = isDark ? '#f4f7fb' : '#0f172a';
+  const borderColor = isDark ? '#334155' : '#e6ebf3';
+  const anotherBorderColor = isDark ? '#e6ebf3' : '#334155';
+  const textColor = isDark ? '#cbd5e1' : '#516079';
+  const anotherTextColor = isDark ? '#516079' : '#cbd5e1';
+  const selectedBorderColor = isDark ? '#3b82f6' : '#2563eb';
+  // AI 风险等级对应的颜色方案
+  const aiRiskColors = {
+    low: {
+      bg: isDark ? '#86efac' : '#166534',
+    },
+    medium: {
+      bg: isDark ? '#fde047' : '#854d0e', 
+    },
+    high: {
+      bg: isDark ? '#fca5a5' : '#991b1b',
+    },
+  };
+  return node.map(n => {
+    const useAiColor = (n?.aiStatu ?? 'undo') === 'done' && n.aiRank && aiRiskColors[n.aiRank];
+    let itemBgColor: string;
+    let itemBorderColor: string;
+    let labelColor: string;
+    let labelBgColor: string;
+    if(useAiColor)
+    {
+      const colors = aiRiskColors[n.aiRank!];
+      labelColor = "#516079";
+      labelBgColor = colors.bg;
+    }
+    else 
+    {
+      labelColor = textColor;
+      labelBgColor = backgroundColor;
+    }
+
+    if(n?.chioced??false)
+    {
+      itemBgColor = selectedBorderColor;
+      itemBorderColor = selectedBorderColor;
+    }
+    else 
+    {
+      const isEven = n.path.length % 2 === 0;
+      itemBgColor = isEven ? backgroundColor : anotherBackgroundColor;
+      itemBorderColor = isEven ? borderColor : anotherBorderColor;
+    }
+
+    const newNode: any = {
+      ...n,
+      children: n.hidden ? undefined : buildViewData(n.children ?? []),
+      itemStyle: {
+        borderColor: itemBorderColor,
+        backgroundColor: itemBgColor,
+      },
+      label: {
+        color: labelColor,
+        backgroundColor: labelBgColor,
+      },
+      // upperLabel: {
+      //   height: 28,
+      //   fontSize: 12,
+      //   color: n.path.length%2==0 ? textColor : anotherTextColor,
+      //   backgroundColor: 'transparent'
+      // }
+    };
+    return newNode;
+  });
+}
+
+async function singleAiAdvise(node:RawNode)
+{
+  if (!report.value) {
+    message.error('没有扫描报告');
+    return;
+  }
+  let relativePath=[...node.path.slice(1),node.name].join('\\');
+  const fullPath = report.value.root + (relativePath ? '\\' + relativePath : '');
+  console.log(fullPath);
+  if(node==null)return;
+  if(node?.aiStatu??"undo"!="undo")return;
+  node.aiStatu="wait";
+  try{
+    const insight = await invoke<FileAiInsight>("explain_file_with_ai",{path:fullPath});
+    node.aiBrief=insight.summary;
+    node.aiReson=insight.reason;
+    node.aiRank=insight.risk;
+    node.aiStatu="done";
+    console.log(node);
+  }
+  catch(error){
+    message.error(`ai解读失败：${error}`);
+    node.aiStatu="undo";
+  }
+  
+}
+async function choiceAiAdvise() {
+  if (choicedFilePath.value.size === 0) {
+    message.warning('请先选择要分析的文件或目录');
+    return;
+  }
+  
+  const paths = Array.from(choicedFilePath.value);
+  message.info(`开始对 ${paths.length} 个选中项进行 AI 分析...`);
+  for(const pathKey of paths)
+  {
+    const pathArray = pathKey.split('/');
+    let node = getNodeByPath(pathArray);
+    if(node == null) {
+      console.warn(`未找到节点: ${pathKey}`);
+      continue;
+    }
+    node.chioced = false;
+  }
+  for(const pathKey of paths) {
+    try {
+      const pathArray = pathKey.split('/');
+      let node = getNodeByPath(pathArray);
+      if (node == null) {
+        continue;
+      }
+      singleAiAdvise(node);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    } catch (error) {
+      console.error(`处理路径 ${pathKey} 时出错:`, error);
+    }
+  }
+  choicedFilePath.value.clear();
+}
+
+const computedViewData = computed(() => {
+  let rootnode=getNodeByPath(viewRootPath.value);
+  return buildViewData(rootnode?.children??[]);
+})
+
+const chartOption = computed(() => {
+  const isDark = store.theme === 'dark';
+  const backgroundColor = isDark ? '#0f172a' : '#f4f7fb';
+  const borderColor = isDark ? '#334155' : '#e6ebf3';
+  const textColor = isDark ? '#cbd5e1' : '#516079';
+  return {
+    tooltip: {
+      confine: true,
+      extraCssText: `max-width: 400px; white-space: normal; word-wrap: break-word; word-break: break-word; background-color: ${backgroundColor};`,
+      formatter: (params: any) => {
+        if((params?.data?.aiStatu??"undo")!="done")
+        {
+          return `
+          <div style="max-width: 380px; word-wrap: break-word; word-break: break-word;">
+            <strong style="display: block; margin-bottom: 4px; color: ${textColor};">${params.name}</strong>
+            <span style="color: ${textColor};">大小: ${params.value} KB</span>
+          </div>`;
+        }
+        else
+        {
+          return `
+          <div style="max-width: 380px; word-wrap: break-word; word-break: break-word;">
+            <strong style="display: block; margin-bottom: 6px; color: ${textColor}; word-break: break-all;">${params.name}</strong>
+            <div style="margin-bottom: 8px; color: ${textColor};">大小: ${params.value} KB</div>
+            <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid ${borderColor};">
+              <div style="color: ${textColor}; font-size: 12px; margin-bottom: 4px;">删除风险 AI 评级：</div>
+              <div style="color: ${textColor}; line-height: 1.6; word-wrap: break-word; word-break: break-word; white-space: pre-wrap;">${params?.data?.aiRank??'暂无'}</div>
+            </div>
+            <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid ${borderColor};">
+              <div style="color: ${textColor}; font-size: 12px; margin-bottom: 4px;">AI 总结：</div>
+              <div style="color: ${textColor}; line-height: 1.6; word-wrap: break-word; word-break: break-word; white-space: pre-wrap;">${params?.data?.aiBrief??'暂无'}</div>
+            </div>
+            <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid ${borderColor};">
+              <div style="color: ${textColor}; font-size: 12px; margin-bottom: 4px;">AI 详解：</div>
+              <div style="color: ${textColor}; line-height: 1.6; word-wrap: break-word; word-break: break-word; white-space: pre-wrap;">${params?.data?.aiReson??'暂无'}</div>
+            </div>
+          </div>`;
+        }
+        
+      },
+    },
+    series: [
+      {
+        type: 'treemap',
+        animation: false,
+        data: computedViewData.value,
+        width: '100%',
+        height: '100%',
+        nodeClick: false,
+        breadcrumb: { show: false },
+        itemStyle: {
+          borderWidth: 3,
+          gapWidth: 3,
+        },
+        upperLabel: {
+          show: true,
+          height: 28,
+          fontSize: 12,
+          backgroundColor: 'transparent',
+        },
+        label: {
+          show: true,
+          fontSize: 11,
+          formatter: '{b} {c}KB',
+        },
+
+        levels: [
+          {
+            itemStyle: { borderWidth: 0, gapWidth: 0 },
+            upperLabel: { show: false },
+            label: { show: false },
+          }
+        ],
+        leafDepth: 1000,
+      },
+    ],
+  };
+});
+
 const scannedFilesHint = computed(() => {
   if (!report.value) return "";
   return `${TEXT.scannedFilesHintPrefix}${explorerMatchedCount.value}${TEXT.scannedFilesHintMiddle}${explorerNodeCount.value}${TEXT.scannedFilesHintSuffix}`;
@@ -1069,6 +1629,73 @@ function duplicateTagLabel(path: string): string {
       </n-space>
     </n-card>
 
+    <n-card class="surface-card interactive-card" :class="{ 'no-transition': isChartFullscreen }">
+      <template #header>
+        <div class="section-head">
+          <span class="section-head__title">{{ TEXT.visialeExplorerTitle }}</span>
+          <n-button @click="toggleFullscreen">
+              {{ isChartFullscreen ? '退出全屏' : '全屏显示' }}
+          </n-button>
+        </div>
+      </template>
+      <div v-if="!isChartFullscreen" class="chart-container" style="height: 500px;">
+          <div>
+          <n-radio-group v-model:value="chartClickMode">
+          <n-radio-button value="expand">{{ TEXT.clickToExpand }}</n-radio-button>
+          <n-radio-button value="dig">{{ TEXT.clickToDig }}</n-radio-button>            
+          <n-radio-button value="multi">{{ TEXT.multiChoice }}</n-radio-button>
+          <n-radio-button value="darg">{{ TEXT.multiDarg }}</n-radio-button>
+          </n-radio-group>
+          <n-button @click="handleToParentPath">{{TEXT.toParentPath}}</n-button>
+          <n-button @click="handleToChoiceAll">{{TEXT.toChoiceAll}}</n-button>
+          <n-button @click="handleToChoiceInvert">{{TEXT.toChoiceInvert}}</n-button>
+          <n-button @click="handleToChoiceNull">{{TEXT.toChoiceNull}}</n-button>
+          <n-button @click="handleToPackAll">{{TEXT.toPackAll}}</n-button>
+          <n-button @click="choiceAiAdvise">{{TEXT.toAiAdvise}}</n-button>
+          </div>
+        <v-chart
+          ref="chartRef"
+          :option="chartOption"
+          @click="handleChartClick"
+          autoresize
+          style="width: 100%; height: 95%;"
+        />
+      </div>
+    </n-card>
+
+    <Teleport to="body">
+      <div v-if="isChartFullscreen" class="fullscreen-overlay">
+        <div>
+          <n-button @click="toggleFullscreen">
+              {{ isChartFullscreen ? '退出全屏' : '全屏显示' }}
+          </n-button>
+        </div>
+        <div class="fullscreen-content">
+          <div>
+          <n-radio-group v-model:value="chartClickMode">
+          <n-radio-button value="expand">{{ TEXT.clickToExpand }}</n-radio-button>
+          <n-radio-button value="dig">{{ TEXT.clickToDig }}</n-radio-button>            
+          <n-radio-button value="multi">{{ TEXT.multiChoice }}</n-radio-button>
+          <n-radio-button value="darg">{{ TEXT.multiDarg }}</n-radio-button>
+          </n-radio-group>
+          <n-button @click="handleToParentPath">{{TEXT.toParentPath}}</n-button>
+          <n-button @click="handleToChoiceAll">{{TEXT.toChoiceAll}}</n-button>
+          <n-button @click="handleToChoiceInvert">{{TEXT.toChoiceInvert}}</n-button>
+          <n-button @click="handleToChoiceNull">{{TEXT.toChoiceNull}}</n-button>
+          <n-button @click="handleToPackAll">{{TEXT.toPackAll}}</n-button>
+          <n-button @click="choiceAiAdvise">{{TEXT.toAiAdvise}}</n-button>
+          </div>
+           <v-chart
+            ref="chartRef"
+            :option="chartOption"
+            @click="handleChartClick"
+            autoresize
+            style="width: 100%; height: 95%;"
+          />
+        </div>
+      </div>
+    </Teleport>
+
     <AppOverviewSection
       :report-key="reportKey"
       :selected-app-key="selectedApp?.key ?? null"
@@ -1442,6 +2069,23 @@ function duplicateTagLabel(path: string): string {
   width: 100%;
   height: 52px;
   border-radius: 18px;
+}
+
+.fullscreen-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background-color: var(--app-bg);
+  z-index: 9999;
+  box-sizing: border-box;
+}
+
+.fullscreen-content {
+  width: 100%;
+  height: 100%;
+  background-color: var(--app-bg);
 }
 
 @media (max-width: 1024px) {

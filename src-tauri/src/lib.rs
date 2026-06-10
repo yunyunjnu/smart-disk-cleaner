@@ -29,6 +29,7 @@ pub fn run() {
             commands::scan::query_file_tree,
             commands::scan::query_file_tree_v2,
             commands::scan::query_directory_tree_v2,
+            commands::scan::load_directory_children,
             commands::scan::cancel_scan,
             commands::scan::diagnose_path,
             commands::cleanup::execute_cleanup,
