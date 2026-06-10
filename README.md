@@ -320,8 +320,7 @@ AI 可以解释，不可以代替最终确认。
 ### 启动桌面应用
 
 ```bash
-npm --prefix ui install
-npx tauri dev
+npm run tauri dev
 ```
 
 ### 构建检查
