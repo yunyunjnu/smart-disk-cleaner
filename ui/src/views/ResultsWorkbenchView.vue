@@ -637,13 +637,13 @@ function buildViewData(node:RawNode[])
   // AI 风险等级对应的颜色方案
   const aiRiskColors = {
     low: {
-      bg: isDark ? '#86efac' : '#166534',
+      bg: isDark ? '#86efac' : '#86efac',
     },
     medium: {
-      bg: isDark ? '#fde047' : '#854d0e', 
+      bg: isDark ? '#fde047' : '#fde047', 
     },
     high: {
-      bg: isDark ? '#fca5a5' : '#991b1b',
+      bg: isDark ? '#fca5a5' : '#fca5a5',
     },
   };
   return node.map(n => {
